@@ -773,7 +773,7 @@ func (a *API) WriteAPIMethods(p, pp PrintFn, svcName string, service *Service) {
 						path = path[:idx] + `" + ` + "fmt.Sprintf(\"%v\", c." + Depunct(param.Value.Name, false) + ")" + ` + "` + path[idx+1+endIdx+1:]
 					}
 				}
-				methodType := "http.Method" + method
+				methodType := "http.Method" + Depunct(method, true)
 
 				// write request
 				pp("// Do executes the %s.", svcName+op.OperationID)
