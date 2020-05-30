@@ -309,7 +309,7 @@ func modelFileName(name string) string {
 func (a *API) GetService() Services {
 	a.servicesOnce.Do(func() {
 		i := 0
-		for methods, _ := range a.GetMethods() {
+		for methods := range a.GetMethods() {
 			if a.services == nil { // lazy initialize
 				a.services = make(Services, len(a.methods))
 			}
@@ -817,7 +817,7 @@ func (a *API) WriteModel(p, pp PrintFn, name string, component *openapi3.SchemaR
 	if component.Value != nil {
 		// sort fields
 		fields := make([]string, 0, len(component.Value.Properties))
-		for field, _ := range component.Value.Properties {
+		for field := range component.Value.Properties {
 			fields = append(fields, field)
 		}
 		sort.Strings(fields)
