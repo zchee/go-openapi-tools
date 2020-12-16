@@ -1,6 +1,5 @@
-// Copyright 2020 The go-openapi-tools Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright 2020 The go-openapi-tools Authors.
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Command oapi-generator generates the Go API client code from OpenAPI or Swagger schema.
 package main
