@@ -9,3 +9,6 @@ docs        linguist-documentation
 *.pb.go     linguist-generated
 *_gen.go    linguist-generated
 *_string.go linguist-generated
+
+# include "DO NOT EDIT" line
+pkg/compiler/oapigen/gen.go -linguist-generated
