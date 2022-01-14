@@ -1,7 +1,7 @@
 // Copyright 2020 The go-openapi-tools Authors.
 // SPDX-License-Identifier: BSD-3-Clause
 
-package oapigen
+package compiler
 
 import (
 	"bytes"

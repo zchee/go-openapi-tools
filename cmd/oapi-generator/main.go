@@ -9,7 +9,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/zchee/go-openapi-tools/pkg/compiler/oapigen"
+	"github.com/zchee/go-openapi-tools/pkg/compiler"
 )
 
 const (
@@ -23,7 +23,7 @@ var (
 )
 
 func init() {
-	flag.StringVar(&flagSchemaType, "schema", oapigen.OpenAPISchema.String(), "Schema type.")
+	flag.StringVar(&flagSchemaType, "schema", compiler.OpenAPISchema.String(), "Schema type.")
 	flag.StringVar(&flagPackageName, "package", "api", "generate package name.")
 	flag.StringVar(&flagOut, "out", "", `write schema to specific directory. (default "current directory")`)
 }
@@ -39,7 +39,7 @@ func main() {
 	}
 	fname := flag.Arg(0)
 
-	api, err := oapigen.NewAPI(fname, flagPackageName, flagSchemaType)
+	api, err := compiler.NewAPI(fname, flagPackageName, flagSchemaType)
 	if err != nil {
 		log.Fatal(err)
 	}

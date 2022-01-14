@@ -2,4 +2,4 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package oapigen provides automatically generates Go API client based on OpenAPI schema.
-package oapigen
+package compiler
