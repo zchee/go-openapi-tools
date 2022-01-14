@@ -21,8 +21,8 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/getkin/kin-openapi/openapi3gen"
-	"github.com/getkin/kin-openapi/pathpattern"
-	jsoniter "github.com/json-iterator/go"
+	"github.com/getkin/kin-openapi/routers"
+	json "github.com/goccy/go-json"
 	"github.com/klauspost/compress/gzip"
 	"github.com/zchee/strcase"
 )
@@ -30,10 +30,10 @@ import (
 // keep related packages on import section.
 var (
 	_ jsoninfo.StrictStruct
-	_ = openapi2conv.ToV3Swagger
+	_ = openapi2conv.ToV3
 	_ openapi3filter.ParseErrorKind
 	_ openapi3gen.Generator
-	_ pathpattern.Node
+	_ routers.Route
 )
 
 const (
@@ -98,7 +98,7 @@ type Services []*Service
 // API represents an Spinnaker API to generate, as well as its state while it's
 // generating.
 type API struct {
-	openAPI    *openapi3.Swagger
+	openAPI    *openapi3.T
 	schemaType SchemaType
 	pkgName    string
 
@@ -137,21 +137,21 @@ func NewAPI(path, name string, schemaType string) (*API, error) {
 	}
 	defer f.Close()
 
-	dec := jsoniter.ConfigFastest.NewDecoder(f)
+	dec := json.NewDecoder(f)
 	switch api.schemaType {
 	case OpenAPISchema:
-		var oai openapi3.Swagger
+		var oai openapi3.T
 		if err := dec.Decode(&oai); err != nil {
 			return nil, fmt.Errorf("failed to decode %s: %w", path, err)
 		}
 		api.openAPI = &oai
 
 	case SwaggerSchema:
-		var swagger *openapi2.Swagger
+		var swagger *openapi2.T
 		if err := dec.Decode(swagger); err != nil {
 			return nil, err
 		}
-		oai, err := openapi2conv.ToV3Swagger(swagger)
+		oai, err := openapi2conv.ToV3(swagger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert %#v to OpenAPI schema: %w", swagger, err)
 		}
@@ -979,7 +979,7 @@ func (a *API) WriteSchemaDescriptor(p, pp printFn) {
 	}
 
 	in := a.openAPI
-	data, err := jsoniter.ConfigFastest.Marshal(in)
+	data, err := json.Marshal(in)
 	if err != nil {
 		panic(err)
 	}
