@@ -4,8 +4,8 @@ go 1.17
 
 require (
 	github.com/getkin/kin-openapi v0.88.0
-	github.com/goccy/go-json v0.9.3
-	github.com/klauspost/compress v1.14.1
+	github.com/goccy/go-json v0.9.4
+	github.com/klauspost/compress v1.14.2
 	github.com/zchee/strcase v0.0.2
 )
 
