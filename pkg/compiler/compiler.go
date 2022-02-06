@@ -4,7 +4,9 @@
 package compiler
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	goformat "go/format"
 	"log"
@@ -13,7 +15,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/getkin/kin-openapi/jsoninfo"
 	"github.com/getkin/kin-openapi/openapi2"
@@ -50,42 +51,68 @@ type printFn func(format string, args ...interface{})
 //  value: []*openapi3.PathItem
 type PathItemsMap map[string][]*openapi3.PathItem
 
-// SchemaType represents a Schema type. supports OpenAPI or Swagger.
-type SchemaType uint8
+const (
+	SchemaNameSwagger = "swagger"
+	SchemaNameOpenAPI = "openapi"
+)
+
+// schemaType represents a Schema type. supports OpenAPI or Swagger.
+type schemaType uint8
 
 const (
-	// UnkonwnSchema is the unkonwn schema.
-	UnkonwnSchema SchemaType = iota
+	// unknownSchema is the unkonwn schema.
+	unknownSchema schemaType = iota
+
+	// swaggerSchema is the swaggerSchema schema.
+	swaggerSchema
 
 	// OpenAPISchema is the OpenAPISchema schema.
-	OpenAPISchema
-
-	// SwaggerSchema is the SwaggerSchema schema.
-	SwaggerSchema
+	openAPISchema
 )
 
 // String returns a string representation of the SchemaType.
-func (st SchemaType) String() string {
+func (st schemaType) String() string {
 	switch st {
-	case OpenAPISchema:
-		return "OpenAPI"
-	case SwaggerSchema:
-		return "Swagger"
+	case swaggerSchema:
+		return SchemaNameSwagger
+	case openAPISchema:
+		return SchemaNameOpenAPI
 	default:
-		return "Unkonwn"
+		return "unknown"
 	}
 }
 
-// SchemaTypeFromString parses s string and returns the correspond SchemaType.
-func SchemaTypeFromString(s string) SchemaType {
-	switch strings.ToLower(s) {
-	case strings.ToLower(OpenAPISchema.String()):
-		return OpenAPISchema
-	case strings.ToLower(SwaggerSchema.String()):
-		return SwaggerSchema
+var schemaTypeMap = map[string]schemaType{
+	SchemaNameSwagger: swaggerSchema,
+	SchemaNameOpenAPI: openAPISchema,
+}
+
+func parseSchemaTye(schemaType, filename string) (schemaType, error) {
+	schemaType = strings.ToLower(schemaType)
+	if st, ok := schemaTypeMap[schemaType]; ok {
+		return st, nil
 	}
 
-	return UnkonwnSchema
+	f, err := os.Open(filename)
+	if err != nil {
+		return unknownSchema, err
+	}
+	defer f.Close()
+
+	scan := bufio.NewScanner(f)
+	for scan.Scan() {
+		switch {
+		case strings.Contains(scan.Text(), SchemaNameSwagger):
+			return swaggerSchema, nil
+		case strings.Contains(scan.Text(), SchemaNameOpenAPI):
+			return openAPISchema, nil
+		}
+	}
+	if err := scan.Err(); err != nil {
+		return unknownSchema, err
+	}
+
+	return unknownSchema, errors.New("unknown schema")
 }
 
 type Service struct {
@@ -95,74 +122,82 @@ type Service struct {
 
 type Services []*Service
 
-// API represents an Spinnaker API to generate, as well as its state while it's
-// generating.
-type API struct {
+// Generator represents a Go source generator from OpenAPI.
+type Generator struct {
 	openAPI    *openapi3.T
-	schemaType SchemaType
+	schemaType schemaType
 	pkgName    string
 
 	buf   *bytes.Buffer
-	files map[string][]byte // map[filename][]byte{data}
+	files map[string][]byte
 
-	services     Services                  // underlyng type: []*openapi3.Tag
+	services     Services                  // lazy initialize
 	servicesOnce sync.Once                 // run GetService once
-	methods      map[*Service]PathItemsMap // map[*Services]map[path][]*openapi3.PathItem
+	methods      map[*Service]PathItemsMap // lazy initialize
 	methodsOnce  sync.Once                 // run GetMethods once
 
 	p  printFn // print raw
 	pp printFn // print with newline
 }
 
-// NewAPI parses path JSON file and returns the new API.
-func NewAPI(path, name string, schemaType string) (*API, error) {
-	api := &API{
-		schemaType: SchemaTypeFromString(schemaType),
-		pkgName:    name,
+// New parses path JSON file and returns the new Generator.
+func New(schemaType, pkgName, filename string) (*Generator, error) {
+	st, err := parseSchemaTye(schemaType, filename)
+	if err != nil {
+		return nil, err
+	}
+	g := &Generator{
+		schemaType: st,
+		pkgName:    pkgName,
 	}
 
 	// handle path arg
-	switch fi, err := os.Stat(path); {
+	switch fi, err := os.Stat(filename); {
 	case os.IsNotExist(err):
-		return nil, fmt.Errorf("not exists %s", path)
+		return nil, fmt.Errorf("not exists %s schema file", filename)
+
 	case fi.IsDir():
-		return nil, fmt.Errorf("%s is directory, not schema file", path)
+		return nil, fmt.Errorf("%s is directory, not schema file", filename)
+
 	case err != nil:
 		return nil, err
 	}
 
-	f, err := os.Open(path)
+	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
 	dec := json.NewDecoder(f)
-	switch api.schemaType {
-	case OpenAPISchema:
+	switch g.schemaType {
+	case openAPISchema:
 		var oai openapi3.T
 		if err := dec.Decode(&oai); err != nil {
-			return nil, fmt.Errorf("failed to decode %s: %w", path, err)
+			return nil, fmt.Errorf("failed to decode %s: %w", filename, err)
 		}
-		api.openAPI = &oai
 
-	case SwaggerSchema:
+		g.openAPI = &oai
+
+	case swaggerSchema:
 		var swagger *openapi2.T
 		if err := dec.Decode(swagger); err != nil {
 			return nil, err
 		}
+
 		oai, err := openapi2conv.ToV3(swagger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert %#v to OpenAPI schema: %w", swagger, err)
 		}
-		api.openAPI = oai
+
+		g.openAPI = oai
 	}
 
-	return api, nil
+	return g, nil
 }
 
-// Gen generates the API from openapi3.Swagger schema.
-func (a *API) Gen(dst string) (err error) {
+// Generate generates the API from openapi3.Swagger schema.
+func (a *Generator) Generate(dst string) (err error) {
 	if dst == "" {
 		dst, err = os.Getwd()
 		if err != nil {
@@ -170,7 +205,7 @@ func (a *API) Gen(dst string) (err error) {
 		}
 	}
 
-	if err := a.gen(); err != nil {
+	if err := a.generate(); err != nil {
 		return fmt.Errorf("failed to generate: %w", err)
 	}
 
@@ -195,109 +230,111 @@ func (a *API) Gen(dst string) (err error) {
 	return nil
 }
 
-// gen generates Go source code from OpenAPI spec.
+// generate generates Go source code from OpenAPI spec.
 //
 // It works sequential, does not needs mutex lock.
-func (a *API) gen() error {
-	a.buf = &bytes.Buffer{}
-	a.files = make(map[string][]byte)
+func (g *Generator) generate() error {
+	g.buf = new(bytes.Buffer)
+	g.files = make(map[string][]byte)
 
-	a.p = func(format string, args ...interface{}) {
-		_, err := fmt.Fprintf(a.buf, format, args...)
+	g.p = func(format string, args ...interface{}) {
+		_, err := fmt.Fprintf(g.buf, format, args...)
 		if err != nil {
 			panic(err)
 		}
 	}
-	a.pp = func(format string, args ...interface{}) {
-		a.p(format+"\n", args...)
+	g.pp = func(format string, args ...interface{}) {
+		g.p(format+"\n", args...)
 	}
 
-	p, pp := a.p, a.pp
-
 	// write doc.go
-	a.WriteHeader(p, pp)
-	p("\n")
-	a.WriteDoc(p, pp)
-	bufDoc := a.buf.Bytes()
+	g.WriteHeader()
+	g.p("\n")
+	g.WriteDoc()
+	bufDoc := g.buf.Bytes()
 	doc, err := goformat.Source(bufDoc)
 	if err != nil {
 		log.Println(err)
 		doc = bufDoc
 	}
-	a.files[docFileName] = doc
+	g.files[docFileName] = doc
 
 	// write client.go
-	a.buf.Reset()
-	a.WriteHeader(p, pp)
-	p("\n")
-	a.WritePackage(p, pp)
-	p("\n")
-	a.WriteImports(p, pp)
-	p("\n")
-	a.WriteConstants(p, pp)
-	p("\n")
-	a.WriteService(p, pp)
-	a.WriteSchemaDescriptor(p, pp)
-	b := a.buf.Bytes()
+	g.buf.Reset()
+	g.WriteHeader()
+	g.p("\n")
+	g.WritePackage()
+	g.p("\n")
+	g.WriteImports()
+	g.p("\n")
+	g.WriteConstants()
+	g.p("\n")
+	g.WriteService()
+	g.WriteSchemaDescriptor()
+
+	b := g.buf.Bytes()
 	out, err := goformat.Source(b)
 	if err != nil {
 		log.Println(err)
 		out = b
 	}
-	a.files[clientFileName] = out
+	g.files[clientFileName] = out
 
 	// write api_xxx.go
-	for _, tag := range a.GetService() { // []*openapi3.Tag
+	for _, tag := range g.GetService() { // []*openapi3.Tag
 		fmt.Printf("tag: %#v\n", tag)
-		a.buf.Reset()
-		a.WriteHeader(p, pp)
-		p("\n")
-		a.WritePackage(p, pp)
-		p("\n")
-		a.WriteImports(p, pp)
-		p("\n")
-		a.WriteAPI(p, pp, tag)
-		bufAPI := a.buf.Bytes()
+		g.buf.Reset()
+		g.WriteHeader()
+		g.p("\n")
+		g.WritePackage()
+		g.p("\n")
+		g.WriteImports()
+		g.p("\n")
+		g.WriteAPI(tag)
+
+		bufAPI := g.buf.Bytes()
 		api, err := goformat.Source(bufAPI)
 		if err != nil {
 			log.Printf("api: %s: %#v\n", tag.Name, err)
 			api = bufAPI
 		}
-		a.files[apiFileName(tag.Name)] = api
+		g.files[apiFileName(tag.Name)] = api
 	}
 
 	// write models
-	for name, def := range a.openAPI.Components.Schemas {
-		a.buf.Reset()
-		a.WriteHeader(p, pp)
-		p("\n")
-		a.WritePackage(p, pp)
-		p("\n")
-		a.WriteModel(p, pp, name, def)
-		bufModel := a.buf.Bytes()
+	for name, def := range g.openAPI.Components.Schemas {
+		g.buf.Reset()
+		g.WriteHeader()
+		g.p("\n")
+		g.WritePackage()
+		g.p("\n")
+		g.WriteModel(name, def)
+
+		bufModel := g.buf.Bytes()
 		model, err := goformat.Source(bufModel)
 		if err != nil {
 			log.Printf("model: %s: %#v\n", name, err)
 			model = bufModel
 		}
-		a.files[modelFileName(name)] = model
+		g.files[modelFileName(name)] = model
 	}
 
 	// write utils.go
-	a.buf.Reset()
-	a.WriteHeader(p, pp)
-	p("\n")
-	a.WritePackage(p, pp)
-	p("\n")
-	a.WriteImports(p, pp)
-	p("\n")
-	bufUtils := a.buf.Bytes()
+	g.buf.Reset()
+	g.WriteHeader()
+	g.p("\n")
+	g.WritePackage()
+	g.p("\n")
+	g.WriteImports()
+	g.p("\n")
+
+	bufUtils := g.buf.Bytes()
 	utils, err := goformat.Source(bufUtils)
 	if err != nil {
 		log.Printf("utils: %#v\n", err)
 		utils = bufUtils
 	}
-	a.files[utilsFileName] = utils
+	g.files[utilsFileName] = utils
 
 	return nil
 }
@@ -311,7 +348,7 @@ func modelFileName(name string) string {
 }
 
 // GetService gets sorted openapi3.Tags, sorted by openapi3.Tag.Name.
-func (a *API) GetService() Services {
+func (a *Generator) GetService() Services {
 	a.servicesOnce.Do(func() {
 		i := 0
 		for methods := range a.GetMethods() {
@@ -321,6 +358,7 @@ func (a *API) GetService() Services {
 			a.services[i] = methods
 			i++
 		}
+
 		sort.SliceStable(a.services, func(i, j int) bool { return a.services[i].Name < a.services[j].Name })
 	})
 
@@ -330,7 +368,7 @@ func (a *API) GetService() Services {
 var defaultService = &Service{Name: "default"}
 
 // GetMethods gets services method from the parses openapi3.Tags.
-func (a *API) GetMethods() map[*Service]PathItemsMap {
+func (a *Generator) GetMethods() map[*Service]PathItemsMap {
 	a.methodsOnce.Do(func() {
 		a.methods = make(map[*Service]PathItemsMap)
 
@@ -338,6 +376,7 @@ func (a *API) GetMethods() map[*Service]PathItemsMap {
 		switch len(a.openAPI.Tags) {
 		case 0:
 			a.methods[defaultService] = make(map[string][]*openapi3.PathItem)
+
 		default:
 			// initialize a.methods map keys to *openapi3.Tag
 			for _, tag := range a.openAPI.Tags {
@@ -378,21 +417,21 @@ func (a *API) GetMethods() map[*Service]PathItemsMap {
 	return a.methods
 }
 
-const headerFmt = `// Code generated file. DO NOT EDIT.`
+const headerFmt = `// Code generated by oapi-generator. DO NOT EDIT.`
 
 // WriteHeader writes license and any file headers.
-func (a *API) WriteHeader(p, pp printFn) {
-	pp(headerFmt, time.Now().Year())
+func (g *Generator) WriteHeader() {
+	g.pp(headerFmt)
 }
 
 // WriteDoc writes package top level synopsis.
-func (a *API) WriteDoc(p, pp printFn) {
-	pp("// Package %s provides access to the %s REST API.", a.pkgName, Depunct(a.pkgName, true))
+func (g *Generator) WriteDoc() {
+	g.pp("// Package %s provides access to the %s REST API.", g.pkgName, Depunct(g.pkgName, true))
 }
 
 // WritePackage writes package statement.
-func (a *API) WritePackage(p, pp printFn) {
-	pp("package %s", a.pkgName)
+func (g *Generator) WritePackage() {
+	g.pp("package %s", g.pkgName)
 }
 
 type externalPackage struct {
@@ -401,8 +440,8 @@ type externalPackage struct {
 }
 
 // WriteImports writes import section.
-func (a *API) WriteImports(p, pp printFn) {
-	pp("import (")
+func (g *Generator) WriteImports() {
+	g.pp("import (")
 
 	// write std packages
 	pkgs := []string{
@@ -421,10 +460,10 @@ func (a *API) WriteImports(p, pp printFn) {
 		"strings",
 	}
 	for _, pkg := range pkgs {
-		pp("	%q", pkg)
+		g.pp("	%q", pkg)
 	}
 
-	p("\n")
+	g.p("\n")
 
 	// write external packages
 	extPkgs := []externalPackage{
@@ -434,96 +473,96 @@ func (a *API) WriteImports(p, pp printFn) {
 		},
 	}
 	for _, ext := range extPkgs {
-		pp("	%s %q", ext.alias, ext.pkg)
+		g.pp("	%s %q", ext.alias, ext.pkg)
 	}
-	pp(")")
+	g.pp(")")
 
-	p("\n")
+	g.p("\n")
 
 	// write keep imported package pragma
-	pp("// Always reference these packages, just in case the auto-generated code below doesn't.")
-	pp("var (")
-	pp("	_ = bytes.NewBuffer")
-	pp("	_ = context.Canceled")
-	pp("	_ = json.NewDecoder")
-	pp("	_ = errors.New")
-	pp("	_ = fmt.Sprintf")
-	pp("	_ = io.Copy")
-	pp("	_ = ioutil.ReadAll")
-	pp("	_ = http.NewRequest")
-	pp("	_ = url.Parse")
-	pp("	_ = strconv.Itoa")
-	pp("	_ = path.Join")
-	pp("	_ = strings.Replace")
-	pp("	_ = gzip.NewReader")
-	pp("	_ = htransport.NewClient")
-	pp(")")
+	g.pp("// Always reference these packages, just in case the auto-generated code below doesn't.")
+	g.pp("var (")
+	g.pp("	_ = bytes.NewBuffer")
+	g.pp("	_ = context.Canceled")
+	g.pp("	_ = json.NewDecoder")
+	g.pp("	_ = errors.New")
+	g.pp("	_ = fmt.Sprintf")
+	g.pp("	_ = io.Copy")
+	g.pp("	_ = ioutil.ReadAll")
+	g.pp("	_ = http.NewRequest")
+	g.pp("	_ = url.Parse")
+	g.pp("	_ = strconv.Itoa")
+	g.pp("	_ = path.Join")
+	g.pp("	_ = strings.Replace")
+	g.pp("	_ = gzip.NewReader")
+	g.pp("	_ = htransport.NewClient")
+	g.pp(")")
 }
 
 // WriteConstants writes constants.
-func (a *API) WriteConstants(p, pp printFn) {
-	version := a.openAPI.Info.Version
+func (g *Generator) WriteConstants() {
+	version := g.openAPI.Info.Version
 
 	// exported fields
-	pp("const (")
-	pp("	APIVersion = %q", version)
-	pp("	UserAgent = \"oaigen/\" + APIVersion")
-	pp(")")
+	g.pp("const (")
+	g.pp("	APIVersion = %q", version)
+	g.pp("	UserAgent = \"oaigen/\" + APIVersion")
+	g.pp(")")
 
-	p("\n")
+	g.p("\n")
 
 	// unexported fields
-	pp("const (")
-	switch len(a.openAPI.Servers) {
+	g.pp("const (")
+	switch len(g.openAPI.Servers) {
 	case 0:
-		pp("	basePath = %q", "/")
+		g.pp("	basePath = %q", "/")
 	case 1:
-		pp("	basePath = %q", a.openAPI.Servers[0].URL)
+		g.pp("	basePath = %q", g.openAPI.Servers[0].URL)
 	}
-	pp(")")
+	g.pp(")")
 }
 
 // WriteService writes API Service struct and New function.
-func (a *API) WriteService(p, pp printFn) {
+func (g *Generator) WriteService() {
 	var serviceNames []string // for cache sorted service names
 
 	// write Service struct
-	pp("// Service represents a %ss.", Depunct(a.pkgName, true)+" Service")
-	pp("type Service struct {")
-	pp("	client *http.Client")
-	pp("	BasePath string // API endpoint base URL")
-	pp("	UserAgent string // optional additional User-Agent fragment")
-	p("\n")
-	for i, tag := range a.GetService() {
+	g.pp("// Service represents a %ss.", Depunct(g.pkgName, true)+" Service")
+	g.pp("type Service struct {")
+	g.pp("	client *http.Client")
+	g.pp("	BasePath string // API endpoint base URL")
+	g.pp("	UserAgent string // optional additional User-Agent fragment")
+	g.p("\n")
+	for i, tag := range g.GetService() {
 		if serviceNames == nil {
-			serviceNames = make([]string, len(a.services)) // lazy initialize
+			serviceNames = make([]string, len(g.services)) // lazy initialize
 		}
 		svcName := Depunct(tag.Name, true)
-		pp("	%[1]s *%[1]s", svcName)
+		g.pp("	%[1]s *%[1]s", svcName)
 		serviceNames[i] = svcName
 	}
-	pp("}")
+	g.pp("}")
 
 	// write NewService function
-	pp("// NewService creates a new %s.", Depunct(a.pkgName, true)+" Service")
-	pp("func NewService(ctx context.Context) (*Service, error) {")
-	pp("	client, _, err := htransport.NewClient(ctx)")
-	pp("	if err != nil { return nil, err }\n")
-	pp("	svc := &Service{client: client, BasePath: basePath}")
+	g.pp("// NewService creates a new %s.", Depunct(g.pkgName, true)+" Service")
+	g.pp("func NewService(ctx context.Context) (*Service, error) {")
+	g.pp("	client, _, err := htransport.NewClient(ctx)")
+	g.pp("	if err != nil { return nil, err }\n")
+	g.pp("	svc := &Service{client: client, BasePath: basePath}")
 	for _, svcName := range serviceNames {
-		pp("	svc.%[1]s = New%[1]s(svc)", svcName)
+		g.pp("	svc.%[1]s = New%[1]s(svc)", svcName)
 	}
-	p("\n")
-	pp("	return svc, nil")
-	pp("}")
+	g.p("\n")
+	g.pp("	return svc, nil")
+	g.pp("}")
 
-	p("\n")
+	g.p("\n")
 
 	// write userAgent method
-	pp("func (s *Service) userAgent() string {")
-	pp("	if s.UserAgent == \"\" { return UserAgent }")
-	pp("	return UserAgent + \" \" + s.UserAgent")
-	pp("}")
+	g.pp("func (s *Service) userAgent() string {")
+	g.pp("	if s.UserAgent == \"\" { return UserAgent }")
+	g.pp("	return UserAgent + \" \" + s.UserAgent")
+	g.pp("}")
 }
 
 // https://github.com/swagger-api/swagger-codegen/blob/99673744630a/modules/swagger-codegen/src/main/java/io/swagger/codegen/languages/AbstractGoCodegen.java#L62-L80
@@ -551,7 +590,7 @@ var typeConvMap = map[string]string{
 }
 
 // WriteAPI writes child API service structs and New(Service) function.
-func (a *API) WriteAPI(p, pp printFn, tag *Service) {
+func (g *Generator) WriteAPI(tag *Service) {
 	svcName := Depunct(tag.Name, true)
 
 	// writes service description, if any
@@ -562,31 +601,31 @@ func (a *API) WriteAPI(p, pp printFn, tag *Service) {
 				description += "."
 			}
 
-			p("// %s represents ", svcName)
-			p("a")
+			g.p("// %s represents ", svcName)
+			g.p("a")
 			// add 'n' if first letter of description is vowel
 			if IsVowel(rune(description[0])) {
-				p("n")
+				g.p("n")
 			}
-			pp(" %s", description)
+			g.pp(" %s", description)
 		}
 	}
 
 	// write service struct
-	pp("type %s struct {", svcName)
-	pp("	s *Service")
-	pp("}")
+	g.pp("type %s struct {", svcName)
+	g.pp("	s *Service")
+	g.pp("}")
 
 	// write NewXXX function
-	pp("// New%[1]s returns the new %[1]s.", svcName)
-	pp("func New%[1]s(s *Service) *%[1]s {", svcName)
-	pp("	rs := &%s{s: s}", svcName)
-	pp("	return rs")
-	pp("}")
+	g.pp("// New%[1]s returns the new %[1]s.", svcName)
+	g.pp("func New%[1]s(s *Service) *%[1]s {", svcName)
+	g.pp("	rs := &%s{s: s}", svcName)
+	g.pp("	return rs")
+	g.pp("}")
 
-	p("\n")
+	g.p("\n")
 
-	a.WriteAPIMethods(p, pp, svcName, tag)
+	g.WriteAPIMethods(svcName, tag)
 }
 
 const (
@@ -596,12 +635,12 @@ const (
 )
 
 // WriteAPIMethods writes child Service methods.
-func (a *API) WriteAPIMethods(p, pp printFn, svcName string, service *Service) {
+func (g *Generator) WriteAPIMethods(svcName string, service *Service) {
 	operations := make(map[string]map[string]*openapi3.Operation) // map[path]map[method]*openapi3.Operation
-	paths := make([]string, 0, len(a.methods[service]))
+	paths := make([]string, 0, len(g.methods[service]))
 	methods := make([]string, 0, 7)
 
-	for path, pathItems := range a.methods[service] { // map[path][]*openapi3.PathItem
+	for path, pathItems := range g.methods[service] { // map[path][]*openapi3.PathItem
 		paths = append(paths, path)
 		for _, item := range pathItems { // []*openapi3.PathItem
 			for method, o := range item.Operations() { // map[method]*openapi3.Operation
@@ -674,19 +713,19 @@ func (a *API) WriteAPIMethods(p, pp printFn, svcName string, service *Service) {
 						summary += "."
 					}
 
-					pp("// %s provides the %s", methType, summary)
+					g.pp("// %s provides the %s", methType, summary)
 				}
 
 				// write service struct
-				pp("type %s struct {", methType)
-				pp("	s *Service")
-				pp("	header http.Header")
-				pp("	params url.Values")
-				p("\n")
+				g.pp("type %s struct {", methType)
+				g.pp("	s *Service")
+				g.pp("	header http.Header")
+				g.pp("	params url.Values")
+				g.p("\n")
 
 				// write path fields
 				if len(pathParam) > 0 {
-					pp("	// path fields")
+					g.pp("	// path fields")
 					for _, param := range pathParam { // []*openapi3.ParameterRef
 						paramName := NormalizeParam(Depunct(param.Value.Name, false))
 						paramType, ok := typeConvMap[param.Value.Schema.Value.Type]
@@ -694,12 +733,12 @@ func (a *API) WriteAPIMethods(p, pp printFn, svcName string, service *Service) {
 							continue
 						}
 
-						pp("	%s %s", paramName, paramType)
+						g.pp("	%s %s", paramName, paramType)
 					}
 				}
 				// write query fields
 				if len(pm[openapi3.ParameterInQuery]) > 0 {
-					pp("	// query fields")
+					g.pp("	// query fields")
 					for _, param := range pm[openapi3.ParameterInQuery] { // []*openapi3.ParameterInQuery
 						paramName := NormalizeParam(Depunct(param.Value.Name, false))
 						paramType, ok := typeConvMap[param.Value.Schema.Value.Type]
@@ -707,13 +746,13 @@ func (a *API) WriteAPIMethods(p, pp printFn, svcName string, service *Service) {
 							continue
 						}
 
-						pp("	%s %s", paramName, paramType)
+						g.pp("	%s %s", paramName, paramType)
 					}
 				}
-				pp("}")
+				g.pp("}")
 				seen[methType] = true
 
-				p("\n")
+				g.p("\n")
 
 				// writes operation summary, if any
 				if summary := strings.ToLower(op.Summary); summary != "" {
@@ -722,48 +761,48 @@ func (a *API) WriteAPIMethods(p, pp printFn, svcName string, service *Service) {
 						summary += "."
 					}
 
-					pp("// %s returns the %s for %s", op.OperationID, methType, summary)
+					g.pp("// %s returns the %s for %s", op.OperationID, methType, summary)
 				}
 
 				// write method
-				p("func (r *%s) %s(", svcName, op.OperationID)
+				g.p("func (r *%s) %s(", svcName, op.OperationID)
 				if len(pathParam) > 0 {
 					for i, param := range pathParam {
-						p("%s %s", Depunct(param.Value.Name, false), param.Value.Schema.Value.Type)
+						g.p("%s %s", Depunct(param.Value.Name, false), param.Value.Schema.Value.Type)
 						if i < len(pathParam)-1 {
-							p(", ")
+							g.p(", ")
 						}
 					}
 				}
-				pp(") *%s {", methType)
-				pp("	c := &%s{", methType)
-				pp("		s: r.s,")
-				pp("		header: make(http.Header),")
-				pp("		params: url.Values{},")
+				g.pp(") *%s {", methType)
+				g.pp("	c := &%s{", methType)
+				g.pp("		s: r.s,")
+				g.pp("		header: make(http.Header),")
+				g.pp("		params: url.Values{},")
 				if len(pathParam) > 0 {
 					for _, param := range pathParam {
-						pp("		%[1]s: %[1]s,", Depunct(param.Value.Name, false))
+						g.pp("		%[1]s: %[1]s,", Depunct(param.Value.Name, false))
 					}
 				}
-				pp("	}")
-				pp("	return c")
-				pp("}")
+				g.pp("	}")
+				g.pp("	return c")
+				g.pp("}")
 
-				p("\n")
+				g.p("\n")
 
 				// write query method chains
 				for _, param := range pm[openapi3.ParameterInQuery] { // []*openapi3.Parameter
 					paramName := NormalizeParam(Depunct(param.Value.Name, false))
 					argName := Depunct(paramName, true)
 					typeName := paramName
-					pp("func (c *%[1]s) %[2]s(%[3]s %[4]s) *%[1]s {", methType, argName, typeName, typeConvMap[param.Value.Schema.Value.Type])
-					pp("	c.params.Set(%[1]q, fmt.Sprintf(\"%%v\", %[1]s))", typeName)
-					pp("	return c")
-					pp("}")
-					p("\n")
+					g.pp("func (c *%[1]s) %[2]s(%[3]s %[4]s) *%[1]s {", methType, argName, typeName, typeConvMap[param.Value.Schema.Value.Type])
+					g.pp("	c.params.Set(%[1]q, fmt.Sprintf(\"%%v\", %[1]s))", typeName)
+					g.pp("	return c")
+					g.pp("}")
+					g.p("\n")
 				}
 
-				p("\n")
+				g.p("\n")
 
 				// replace {xxx} in path
 				if len(pathParam) > 0 {
@@ -780,53 +819,55 @@ func (a *API) WriteAPIMethods(p, pp printFn, svcName string, service *Service) {
 				methodType := "http.Method" + Depunct(method, true)
 
 				// write request
-				pp("// Do executes the %s.", svcName+op.OperationID)
-				pp("func (c *%s) Do(ctx context.Context) (interface{}, error) {", methType)
-				pp("	uri := path.Join(c.s.BasePath, \"%s\")", path)
-				pp("	if len(c.params) > 0 {")
-				pp("		uri += \"?\" + c.params.Encode()")
-				pp("	}")
-				p("\n")
-				pp("	req, err := http.NewRequest(%s, uri, nil)", methodType)
-				pp("	if err != nil { return nil, err }")
-				p("\n")
-				pp("	req.Header.Set(%q, %q)", hdrContentType, mimeJSON)
-				pp("	req.Header.Set(%q, %q)", hdrAcceptEncoding, mimeJSON)
-				p("\n")
-				pp("	resp, err := c.s.client.Do(req.WithContext(ctx))")
-				pp("	if err != nil { return nil, err }")
-				pp("	defer resp.Body.Close()")
-				p("\n")
-				pp("	if resp.StatusCode != 200 {")
-				pp("		return nil, errors.New(resp.Status)")
-				pp("	}")
-				p("\n")
-				pp("	body, err := ioutil.ReadAll(resp.Body)")
-				pp("	if err != nil { return nil, err }")
-				p("\n")
-				pp("	var result interface{}") // TODO(zchee): actual Response type
-				pp("	if err := json.Unmarshal(body, &result); err != nil {")
-				pp("		return nil, err")
-				pp("	}")
-				p("\n")
-				pp("	return result, nil")
-				pp("}")
+				g.pp("// Do executes the %s.", svcName+op.OperationID)
+				g.pp("func (c *%s) Do(ctx context.Context) (interface{}, error) {", methType)
+				g.pp("	uri := path.Join(c.s.BasePath, \"%s\")", path)
+				g.pp("	if len(c.params) > 0 {")
+				g.pp("		uri += \"?\" + c.params.Encode()")
+				g.pp("	}")
+				g.p("\n")
+				g.pp("	req, err := http.NewRequest(%s, uri, nil)", methodType)
+				g.pp("	if err != nil { return nil, err }")
+				g.p("\n")
+				g.pp("	req.Header.Set(%q, %q)", hdrContentType, mimeJSON)
+				g.pp("	req.Header.Set(%q, %q)", hdrAcceptEncoding, mimeJSON)
+				g.p("\n")
+				g.pp("	resp, err := c.s.client.Do(req.WithContext(ctx))")
+				g.pp("	if err != nil { return nil, err }")
+				g.pp("	defer resp.Body.Close()")
+				g.p("\n")
+				g.pp("	if resp.StatusCode != 200 {")
+				g.pp("		return nil, errors.New(resp.Status)")
+				g.pp("	}")
+				g.p("\n")
+				g.pp("	body, err := ioutil.ReadAll(resp.Body)")
+				g.pp("	if err != nil { return nil, err }")
+				g.p("\n")
+				g.pp("	var result interface{}") // TODO(zchee): actual Response type
+				g.pp("	if err := json.Unmarshal(body, &result); err != nil {")
+				g.pp("		return nil, err")
+				g.pp("	}")
+				g.p("\n")
+				g.pp("	return result, nil")
+				g.pp("}\n")
 			}
 		}
 	}
 }
 
 // WriteModel writes model definitions.
-func (a *API) WriteModel(p, pp printFn, name string, component *openapi3.SchemaRef) {
-	if component.Value != nil {
+func (g *Generator) WriteModel(name string, component *openapi3.SchemaRef) {
+	if component.Value != nil && component.Value.Properties != nil {
 		// sort fields
-		fields := make([]string, 0, len(component.Value.Properties))
+		fields := make([]string, len(component.Value.Properties))
+		i := 0
 		for field := range component.Value.Properties {
-			fields = append(fields, field)
+			fields[i] = field
+			i++
 		}
 		sort.Strings(fields)
 
-		p("// %s represents ", Depunct(name, true))
+		g.p("// %s represents ", Depunct(name, true))
 		desc := fmt.Sprintf("a model of %s.", Depunct(name, false))
 		if description := strings.ToLower(component.Value.Description); description != "" {
 			// add dot if description is not end to dot
@@ -841,10 +882,10 @@ func (a *API) WriteModel(p, pp printFn, name string, component *openapi3.SchemaR
 			}
 			desc += " " + description
 		}
-		pp(desc)
+		g.pp(desc)
 
 		fieldTypes := make(map[string]string)
-		pp("type %s struct {", Depunct(name, true))
+		g.pp("type %s struct {", Depunct(name, true))
 		for _, field := range fields {
 			property := component.Value.Properties[field]
 			// TODO(zchee): parse actual field type
@@ -857,10 +898,11 @@ func (a *API) WriteModel(p, pp printFn, name string, component *openapi3.SchemaR
 							if objVal.Items.Value != nil {
 								typ, ok := typeConvMap[objVal.Items.Value.Type]
 								if ok {
-									pp("	%s []%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
+									g.pp("	%s []%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
 									fieldTypes[field] = "[]" + typ
 								}
 							}
+
 						case "object":
 							t := objVal.Type
 							if objVal.Items != nil {
@@ -868,20 +910,20 @@ func (a *API) WriteModel(p, pp printFn, name string, component *openapi3.SchemaR
 							}
 							typ, ok := typeConvMap[t]
 							if ok {
-								pp("	%s %s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
+								g.pp("	%s %s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
 								fieldTypes[field] = typ
 							}
 						default:
 							typ, ok := typeConvMap[objVal.Type]
 							if ok {
-								pp("	%s *%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
+								g.pp("	%s *%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
 								fieldTypes[field] = typ
 							}
 						}
 					} else {
 						typ, ok := typeConvMap[val.Type]
 						if ok {
-							pp("	%s %s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
+							g.pp("	%s %s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
 							fieldTypes[field] = typ
 						}
 					}
@@ -889,20 +931,21 @@ func (a *API) WriteModel(p, pp printFn, name string, component *openapi3.SchemaR
 					if val.Items.Value != nil {
 						typ, ok := typeConvMap[val.Items.Value.Type]
 						if ok {
-							pp("	%s []%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
+							g.pp("	%s []%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
 							fieldTypes[field] = "[]" + typ
 						}
 					}
+
 				default:
 					typ, ok := typeConvMap[val.Type]
 					if ok {
-						pp("	%s *%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
+						g.pp("	%s *%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
 						fieldTypes[field] = typ
 					}
 				}
 			}
 		}
-		pp("}")
+		g.pp("}")
 
 		for _, field := range fields {
 			reciever := strings.ToLower(string(name[0]))
@@ -912,73 +955,75 @@ func (a *API) WriteModel(p, pp printFn, name string, component *openapi3.SchemaR
 			}
 			field := Depunct(field, true)
 
-			pp("// Get%[1]s returns the %[1]s field value if set, zero value otherwise.", field)
-			pp("func (%s *%s) Get%s() (ret %s) {", reciever, Depunct(name, true), field, fieldType)
-			pp(" 	if %[1]s == nil || %[1]s.%[2]s == nil {", reciever, field)
-			pp(" 		return ret")
-			pp(" 	}")
+			g.pp("// Get%[1]s returns the %[1]s field value if set, zero value otherwise.", field)
+			g.pp("func (%s *%s) Get%s() (ret %s) {", reciever, Depunct(name, true), field, fieldType)
+			g.pp(" 	if %[1]s == nil || %[1]s.%[2]s == nil {", reciever, field)
+			g.pp(" 		return ret")
+			g.pp(" 	}")
 			// TODO(zchee): parse actual field type
 			switch fieldType {
 			case "map[string]interface{}", "interface{}":
-				pp(" 	return %s.%s", reciever, field)
+				g.pp(" 	return %s.%s", reciever, field)
 			default:
-				p(" 	return ")
+				g.p(" 	return ")
 				if !strings.HasPrefix(fieldType, "[]") {
-					p("*")
+					g.p("*")
 				}
-				pp("%s.%s", reciever, field)
+				g.pp("%s.%s", reciever, field)
 			}
-			pp("}")
+			g.pp("}")
 
-			p("\n")
+			g.p("\n")
 
-			pp("// Has%s reports whether the field has been set", field)
-			pp("func (%s *%s) Has%s() bool {", reciever, Depunct(name, true), field)
-			pp(" 	if %[1]s != nil && %[1]s.%[2]s != nil {", reciever, field)
-			pp(" 		return true")
-			pp(" 	}")
-			pp(" 	return false")
-			pp("}")
+			g.pp("// Has%s reports whether the field has been set", field)
+			g.pp("func (%s *%s) Has%s() bool {", reciever, Depunct(name, true), field)
+			g.pp(" 	if %[1]s != nil && %[1]s.%[2]s != nil {", reciever, field)
+			g.pp(" 		return true")
+			g.pp(" 	}")
+			g.pp(" 	return false")
+			g.pp("}")
 
-			p("\n")
+			g.p("\n")
 
-			pp("// Set%[1]s gets a reference to the given string and assigns it to the %[1]s field.", field)
+			g.pp("// Set%[1]s gets a reference to the given string and assigns it to the %[1]s field.", field)
+
 			// TODO(zchee): parse actual field type
 			switch {
 			case fieldType == "map[string]interface{}", fieldType == "interface{}":
-				pp("func (%s *%s) Set%s(val %s) {", reciever, Depunct(name, true), field, fieldType)
-				pp("	%s.%s = val", reciever, field)
+				g.pp("func (%s *%s) Set%s(val %s) {", reciever, Depunct(name, true), field, fieldType)
+				g.pp("	%s.%s = val", reciever, field)
+
 			default:
 				if typ, ok := typeConvMap[fieldType]; ok {
 					var hasPtr bool
 					if !strings.HasPrefix(typ, "[]") {
 						hasPtr = true
 					}
-					p("func (%s ", reciever)
+					g.p("func (%s ", reciever)
 					if hasPtr {
-						p("*")
+						g.p("*")
 					}
-					pp("%s) Set%s(val %s) {", Depunct(name, true), field, typ)
+					g.pp("%s) Set%s(val %s) {", Depunct(name, true), field, typ)
 
-					p("	%s.%s = ", reciever, field)
+					g.p("	%s.%s = ", reciever, field)
 					if hasPtr {
-						p("&")
+						g.p("&")
 					}
-					pp("val")
+					g.pp("val")
 				}
 			}
-			pp("}")
+			g.pp("}")
 		}
 	}
 }
 
 // WriteSchemaDescriptor writes base64 encoded, gzipped compressed and JSON marshaled schema spec into generated file.
-func (a *API) WriteSchemaDescriptor(p, pp printFn) {
-	if a.openAPI == nil {
-		return // not write
+func (g *Generator) WriteSchemaDescriptor() {
+	if g.openAPI == nil {
+		return // no-op
 	}
 
-	in := a.openAPI
+	in := g.openAPI
 	data, err := json.Marshal(in)
 	if err != nil {
 		panic(err)
@@ -997,28 +1042,28 @@ func (a *API) WriteSchemaDescriptor(p, pp printFn) {
 	}
 	b := buf.Bytes()
 
-	pp("// SchemaDescriptor returns the Schema file descriptor which is generated code to this file.")
-	pp("func SchemaDescriptor() (interface{}, error) {")
-	pp("	zr, err := gzip.NewReader(bytes.NewReader(fileDescriptor))")
-	pp("	if err != nil { return nil, err }")
-	p("\n")
-	pp("	var buf bytes.Buffer")
-	pp("	_, err = buf.ReadFrom(zr)")
-	pp("	if err != nil { return nil, err }")
-	p("\n")
-	pp("	var v interface{}")
-	pp("	if err := json.NewDecoder(bytes.NewReader(buf.Bytes())).Decode(&v); err != nil {")
-	pp("		return nil, err")
-	pp("	}")
-	p("\n")
-	pp("	return v, nil")
-	pp("}")
+	g.pp("// SchemaDescriptor returns the Schema file descriptor which is generated code to this file.")
+	g.pp("func SchemaDescriptor() (interface{}, error) {")
+	g.pp("	zr, err := gzip.NewReader(bytes.NewReader(fileDescriptor))")
+	g.pp("	if err != nil { return nil, err }")
+	g.p("\n")
+	g.pp("	var buf bytes.Buffer")
+	g.pp("	_, err = buf.ReadFrom(zr)")
+	g.pp("	if err != nil { return nil, err }")
+	g.p("\n")
+	g.pp("	var v interface{}")
+	g.pp("	if err := json.NewDecoder(bytes.NewReader(buf.Bytes())).Decode(&v); err != nil {")
+	g.pp("		return nil, err")
+	g.pp("	}")
+	g.p("\n")
+	g.pp("	return v, nil")
+	g.pp("}")
 
-	p("\n")
+	g.p("\n")
 
-	pp("// fileDescriptor gzipped JSON marshaled Schema object.")
-	pp("var fileDescriptor = []byte{")
-	pp("	// %d bytes of a gzipped Schema file descriptor", len(b))
+	g.pp("// fileDescriptor gzipped JSON marshaled Schema object.")
+	g.pp("var fileDescriptor = []byte{")
+	g.pp("	// %d bytes of a gzipped Schema file descriptor", len(b))
 
 	for len(b) > 0 {
 		n := 16
@@ -1030,9 +1075,9 @@ func (a *API) WriteSchemaDescriptor(p, pp printFn) {
 		for _, c := range b[:n] {
 			s += fmt.Sprintf("0x%02x, ", c)
 		}
-		pp("	%s", s)
+		g.pp("	%s", s)
 
 		b = b[n:]
 	}
-	pp("}")
+	g.pp("}")
 }
