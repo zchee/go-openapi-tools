@@ -1,4 +1,4 @@
-// Copyright 2020 The go-openapi-tools Authors.
+// Copyright 2020 The go-openapi-tools Authors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package compiler
@@ -87,7 +87,7 @@ var schemaTypeMap = map[string]schemaType{
 	SchemaNameOpenAPI: openAPISchema,
 }
 
-func parseSchemaTye(schemaType, filename string) (schemaType, error) {
+func parseSchemaType(schemaType, filename string) (schemaType, error) {
 	schemaType = strings.ToLower(schemaType)
 	if st, ok := schemaTypeMap[schemaType]; ok {
 		return st, nil
@@ -142,7 +142,7 @@ type Generator struct {
 
 // New parses path JSON file and returns the new Generator.
 func New(schemaType, pkgName, filename string) (*Generator, error) {
-	st, err := parseSchemaTye(schemaType, filename)
+	st, err := parseSchemaType(schemaType, filename)
 	if err != nil {
 		return nil, err
 	}
@@ -180,12 +180,12 @@ func New(schemaType, pkgName, filename string) (*Generator, error) {
 		g.openAPI = &oai
 
 	case swaggerSchema:
-		var swagger *openapi2.T
-		if err := dec.Decode(swagger); err != nil {
+		var swagger openapi2.T
+		if err := dec.Decode(&swagger); err != nil {
 			return nil, err
 		}
 
-		oai, err := openapi2conv.ToV3(swagger)
+		oai, err := openapi2conv.ToV3(&swagger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert %#v to OpenAPI schema: %w", swagger, err)
 		}
