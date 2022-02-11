@@ -9,8 +9,8 @@ import (
 	"errors"
 	"fmt"
 	goformat "go/format"
-	"log"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -24,8 +24,8 @@ import (
 	"github.com/getkin/kin-openapi/openapi3gen"
 	"github.com/getkin/kin-openapi/routers"
 	json "github.com/goccy/go-json"
+	"github.com/iancoleman/strcase"
 	"github.com/klauspost/compress/gzip"
-	"github.com/zchee/strcase"
 )
 
 // keep related packages on import section.
@@ -128,6 +128,7 @@ type Generator struct {
 	schemaType schemaType
 	pkgName    string
 
+	f     *os.File
 	buf   *bytes.Buffer
 	files map[string][]byte
 
@@ -149,6 +150,17 @@ func New(schemaType, pkgName, filename string) (*Generator, error) {
 	g := &Generator{
 		schemaType: st,
 		pkgName:    pkgName,
+		buf:        new(bytes.Buffer),
+		files:      make(map[string][]byte),
+	}
+	g.p = func(format string, args ...interface{}) {
+		_, err := fmt.Fprintf(g.buf, format, args...)
+		if err != nil {
+			panic(err)
+		}
+	}
+	g.pp = func(format string, args ...interface{}) {
+		g.p(format+"\n", args...)
 	}
 
 	// handle path arg
@@ -167,9 +179,10 @@ func New(schemaType, pkgName, filename string) (*Generator, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	g.f = f
 
 	dec := json.NewDecoder(f)
+
 	switch g.schemaType {
 	case openAPISchema:
 		var oai openapi3.T
@@ -196,7 +209,7 @@ func New(schemaType, pkgName, filename string) (*Generator, error) {
 	return g, nil
 }
 
-// Generate generates the API from openapi3.Swagger schema.
+// Generate generates the API from openapi3.T schema.
 func (g *Generator) Generate(dst string) (err error) {
 	if dst == "" {
 		dst, err = os.Getwd()
@@ -227,26 +240,31 @@ func (g *Generator) Generate(dst string) (err error) {
 		}
 	}
 
-	return nil
+	return g.f.Close()
+}
+
+func apiFileName(name string) string {
+	filename := "api_" + strcase.ToSnake(name)
+	if strings.HasSuffix(filename, "_test") {
+		filename += "_gen"
+	}
+
+	return filename + ".go"
+}
+
+func modelFileName(name string) string {
+	filename := "model_" + strcase.ToSnake(name)
+	if strings.HasSuffix(filename, "_test") {
+		filename += "_gen"
+	}
+
+	return filename + ".go"
 }
 
 // generate generates Go source code from OpenAPI spec.
 //
 // It works sequential, does not needs mutex lock.
 func (g *Generator) generate() error {
-	g.buf = new(bytes.Buffer)
-	g.files = make(map[string][]byte)
-
-	g.p = func(format string, args ...interface{}) {
-		_, err := fmt.Fprintf(g.buf, format, args...)
-		if err != nil {
-			panic(err)
-		}
-	}
-	g.pp = func(format string, args ...interface{}) {
-		g.p(format+"\n", args...)
-	}
-
 	// write doc.go
 	g.WriteHeader()
 	g.p("\n")
@@ -254,8 +272,7 @@ func (g *Generator) generate() error {
 	bufDoc := g.buf.Bytes()
 	doc, err := goformat.Source(bufDoc)
 	if err != nil {
-		log.Println(err)
-		doc = bufDoc
+		return fmt.Errorf("could not format doc.go: %w", err)
 	}
 	g.files[docFileName] = doc
 
@@ -275,8 +292,7 @@ func (g *Generator) generate() error {
 	b := g.buf.Bytes()
 	out, err := goformat.Source(b)
 	if err != nil {
-		log.Println(err)
-		out = b
+		return fmt.Errorf("could not format client.go: %w", err)
 	}
 	g.files[clientFileName] = out
 
@@ -295,26 +311,39 @@ func (g *Generator) generate() error {
 		bufAPI := g.buf.Bytes()
 		api, err := goformat.Source(bufAPI)
 		if err != nil {
-			log.Printf("api: %s: %#v\n", tag.Name, err)
-			api = bufAPI
+			return fmt.Errorf("could not format %s api: %w", tag.Name, err)
 		}
 		g.files[apiFileName(tag.Name)] = api
 	}
 
+	schemas := make([]string, len(g.openAPI.Components.Schemas))
+	i := 0
+	for name := range g.openAPI.Components.Schemas {
+		schemas[i] = name
+		i++
+	}
+	sort.Strings(schemas)
+
 	// write models
-	for name, def := range g.openAPI.Components.Schemas {
+	for _, name := range schemas {
+		ref := g.openAPI.Components.Schemas[name]
+		if name == "objs_bot_profile" {
+			fmt.Fprintf(os.Stderr, "name: %s, ref: %#v\n", name, ref.Value)
+		}
+	}
+	for _, name := range schemas {
+		ref := g.openAPI.Components.Schemas[name]
 		g.buf.Reset()
 		g.WriteHeader()
 		g.p("\n")
 		g.WritePackage()
 		g.p("\n")
-		g.WriteModel(name, def)
+		g.WriteModel(name, ref, g.openAPI.Components.Schemas)
 
 		bufModel := g.buf.Bytes()
 		model, err := goformat.Source(bufModel)
 		if err != nil {
-			log.Printf("model: %s: %#v\n", name, err)
-			model = bufModel
+			return fmt.Errorf("could not format %s model: %w", name, err)
 		}
 		g.files[modelFileName(name)] = model
 	}
@@ -331,20 +360,13 @@ func (g *Generator) generate() error {
 	bufUtils := g.buf.Bytes()
 	utils, err := goformat.Source(bufUtils)
 	if err != nil {
-		log.Printf("utils: %#v\n", err)
-		utils = bufUtils
+		return fmt.Errorf("could not format utils.go: %w", err)
+		// log.Printf("utils: %#v\n", err)
+		// utils = bufUtils
 	}
 	g.files[utilsFileName] = utils
 
 	return nil
-}
-
-func apiFileName(name string) string {
-	return "api_" + strcase.ToSnakeCase(name) + ".go"
-}
-
-func modelFileName(name string) string {
-	return "model_" + strcase.ToSnakeCase(name) + ".go"
 }
 
 // GetService gets sorted openapi3.Tags, sorted by openapi3.Tag.Name.
@@ -414,7 +436,7 @@ func (g *Generator) GetMethods() map[*Service]PathItemsMap {
 	return g.methods
 }
 
-const headerFmt = `// Code generated by oapi-generator. DO NOT EDIT.`
+const headerFmt = `// Code generated by github.com/zchee/go-openapi-tools/cmd/oapi-generator. DO NOT EDIT.`
 
 // WriteHeader writes license and any file headers.
 func (g *Generator) WriteHeader() {
@@ -424,6 +446,7 @@ func (g *Generator) WriteHeader() {
 // WriteDoc writes package top level synopsis.
 func (g *Generator) WriteDoc() {
 	g.pp("// Package %s provides access to the %s REST API.", g.pkgName, Depunct(g.pkgName, true))
+	g.pp("package %s", g.pkgName)
 }
 
 // WritePackage writes package statement.
@@ -463,15 +486,15 @@ func (g *Generator) WriteImports() {
 	g.p("\n")
 
 	// write external packages
-	extPkgs := []externalPackage{
-		{
-			pkg:   "google.golang.org/api/transport/http",
-			alias: "htransport",
-		},
-	}
-	for _, ext := range extPkgs {
-		g.pp("	%s %q", ext.alias, ext.pkg)
-	}
+	// extPkgs := []externalPackage{
+	// 	{
+	// 		pkg:   "google.golang.org/api/transport/http",
+	// 		alias: "htransport",
+	// 	},
+	// }
+	// for _, ext := range extPkgs {
+	// 	g.pp("	%s %q", ext.alias, ext.pkg)
+	// }
 	g.pp(")")
 
 	g.p("\n")
@@ -492,7 +515,6 @@ func (g *Generator) WriteImports() {
 	g.pp("	_ = path.Join")
 	g.pp("	_ = strings.Replace")
 	g.pp("	_ = gzip.NewReader")
-	g.pp("	_ = htransport.NewClient")
 	g.pp(")")
 }
 
@@ -543,8 +565,7 @@ func (g *Generator) WriteService() {
 	// write NewService function
 	g.pp("// NewService creates a new %s.", Depunct(g.pkgName, true)+" Service")
 	g.pp("func NewService(ctx context.Context) (*Service, error) {")
-	g.pp("	client, _, err := htransport.NewClient(ctx)")
-	g.pp("	if err != nil { return nil, err }\n")
+	g.pp("	client := &http.Client{}")
 	g.pp("	svc := &Service{client: client, BasePath: basePath}")
 	for _, svcName := range serviceNames {
 		g.pp("	svc.%[1]s = New%[1]s(svc)", svcName)
@@ -622,7 +643,7 @@ func (g *Generator) WriteAPI(tag *Service) {
 
 	g.p("\n")
 
-	g.WriteAPIMethods(svcName, tag)
+	g.WriteMethods(svcName, tag)
 }
 
 const (
@@ -631,8 +652,8 @@ const (
 	mimeJSON          = "application/json"
 )
 
-// WriteAPIMethods writes child Service methods.
-func (g *Generator) WriteAPIMethods(svcName string, service *Service) {
+// WriteMethods writes child Service methods.
+func (g *Generator) WriteMethods(svcName string, service *Service) {
 	operations := make(map[string]map[string]*openapi3.Operation) // map[path]map[method]*openapi3.Operation
 	paths := make([]string, 0, len(g.methods[service]))
 	methods := make([]string, 0, 7)
@@ -754,6 +775,31 @@ func (g *Generator) WriteAPIMethods(svcName string, service *Service) {
 
 				g.p("\n")
 
+
+				g.pp("type %sResponse struct {", methType)
+				pathItem := g.openAPI.Paths[path]
+				resp := pathItem.GetOperation(method).Responses["200"]
+				for _, content := range resp.Value.Content {
+					for _, prop := range content.Schema.Value.Properties {
+						omitempty := ""
+						if prop.Ref == "" || prop.Value == nil {
+							continue
+						}
+						if !contains(prop.Ref, prop.Value.Required) {
+							omitempty = ",omitempty"
+						}
+						paramName := NormalizeParam(Depunct(prop.Ref, false))
+						paramType, ok := typeConvMap[prop.Value.Type]
+						if !ok {
+							continue
+						}
+
+						g.pp("	%s %s `json:\"%s%s\"`", paramName, paramType, prop.Ref, omitempty)
+					}
+				}
+				g.pp("}")
+				g.p("\n")
+
 				// writes operation summary, if any
 				if summary := strings.ToLower(op.Summary); summary != "" {
 					// add dot if summary is not end to dot
@@ -819,39 +865,45 @@ func (g *Generator) WriteAPIMethods(svcName string, service *Service) {
 						path = path[:idx] + `" + ` + "fmt.Sprintf(\"%v\", c." + Depunct(param.Value.Name, false) + ")" + ` + "` + path[idx+1+endIdx+1:]
 					}
 				}
-				methodType := "http.Method" + Depunct(method, true)
+				methodType := "http.Method" + strcase.ToCamel(strings.ToLower(method))
 
 				// write request
 				g.pp("// Do executes the %s.", svcName+op.OperationID)
-				g.pp("func (c *%s) Do(ctx context.Context) (interface{}, error) {", methType)
+				g.pp("func (c *%s) Do(ctx context.Context) (*%sResponse, error) {", methType, methType)
 				g.pp("	uri := path.Join(c.s.BasePath, \"%s\")", path)
 				g.pp("	if len(c.params) > 0 {")
 				g.pp("		uri += \"?\" + c.params.Encode()")
 				g.pp("	}")
 				g.p("\n")
-				g.pp("	req, err := http.NewRequest(%s, uri, nil)", methodType)
-				g.pp("	if err != nil { return nil, err }")
+				g.pp("	req, err := http.NewRequestWithContext(ctx, %s, uri, nil)", methodType)
+				g.pp("	if err != nil {")
+				g.pp("		return nil, err")
+				g.pp("	}")
 				g.p("\n")
 				g.pp("	req.Header.Set(%q, %q)", hdrContentType, mimeJSON)
 				g.pp("	req.Header.Set(%q, %q)", hdrAcceptEncoding, mimeJSON)
 				g.p("\n")
-				g.pp("	resp, err := c.s.client.Do(req.WithContext(ctx))")
-				g.pp("	if err != nil { return nil, err }")
+				g.pp("	resp, err := c.s.client.Do(req)")
+				g.pp("	if err != nil {")
+				g.pp("		return nil, err")
+				g.pp("	}")
 				g.pp("	defer resp.Body.Close()")
 				g.p("\n")
 				g.pp("	if resp.StatusCode != 200 {")
 				g.pp("		return nil, errors.New(resp.Status)")
 				g.pp("	}")
 				g.p("\n")
-				g.pp("	body, err := ioutil.ReadAll(resp.Body)")
-				g.pp("	if err != nil { return nil, err }")
+				g.pp("	body, err := io.ReadAll(resp.Body)")
+				g.pp("	if err != nil {")
+				g.pp("		return nil, err")
+				g.pp("	}")
 				g.p("\n")
-				g.pp("	var result interface{}") // TODO(zchee): actual Response type
+				g.pp("	var result %sResponse", methType)
 				g.pp("	if err := json.Unmarshal(body, &result); err != nil {")
 				g.pp("		return nil, err")
 				g.pp("	}")
 				g.p("\n")
-				g.pp("	return result, nil")
+				g.pp("	return &result, nil")
 				g.pp("}\n")
 			}
 		}
@@ -859,164 +911,237 @@ func (g *Generator) WriteAPIMethods(svcName string, service *Service) {
 }
 
 // WriteModel writes model definitions.
-func (g *Generator) WriteModel(name string, component *openapi3.SchemaRef) {
-	if component.Value != nil && component.Value.Properties != nil {
-		// sort fields
-		fields := make([]string, len(component.Value.Properties))
-		i := 0
-		for field := range component.Value.Properties {
-			fields[i] = field
-			i++
+func (g *Generator) WriteModel(modelName string, component *openapi3.SchemaRef, schemas openapi3.Schemas) {
+	if component.Value == nil && component.Value.Properties == nil {
+		return
+	}
+
+	// sort propertyNames
+	propertyNames := make([]string, len(component.Value.Properties))
+	i := 0
+	for name := range component.Value.Properties {
+		propertyNames[i] = name
+		i++
+	}
+	sort.Strings(propertyNames)
+
+	g.p("// %s represents ", Depunct(modelName, true))
+	desc := fmt.Sprintf("a model of %s.", Depunct(modelName, false))
+	if description := strings.ToLower(component.Value.Description); description != "" {
+		// add dot if description is not end to dot
+		if description[len(description)-1] != '.' {
+			description += "."
 		}
-		sort.Strings(fields)
 
-		g.p("// %s represents ", Depunct(name, true))
-		desc := fmt.Sprintf("a model of %s.", Depunct(name, false))
-		if description := strings.ToLower(component.Value.Description); description != "" {
-			// add dot if description is not end to dot
-			if description[len(description)-1] != '.' {
-				description += "."
-			}
-
-			desc = "a"
-			// add 'n' if first letter of description is vowel
-			if IsVowel(rune(description[0])) {
-				desc += "n"
-			}
-			desc += " " + description
+		desc = "a"
+		// add 'n' if first letter of description is vowel
+		if IsVowel(rune(description[0])) {
+			desc += "n"
 		}
-		g.pp(desc)
+		desc += " " + description
+	}
+	g.pp(desc)
 
-		fieldTypes := make(map[string]string)
-		g.pp("type %s struct {", Depunct(name, true))
-		for _, field := range fields {
-			property := component.Value.Properties[field]
-			// TODO(zchee): parse actual field type
-			if property.Value != nil {
-				switch val := property.Value; val.Type {
-				case "object":
-					if val.AdditionalProperties != nil && val.AdditionalProperties.Value != nil {
-						switch objVal := val.AdditionalProperties.Value; objVal.Type {
-						case "array":
-							if objVal.Items.Value != nil {
-								typ, ok := typeConvMap[objVal.Items.Value.Type]
-								if ok {
-									g.pp("	%s []%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
-									fieldTypes[field] = "[]" + typ
-								}
-							}
+	propertyTypes := make(map[string]string)
+	g.pp("type %s struct {", Depunct(modelName, true))
+	for _, name := range propertyNames {
+		property, ok := component.Value.Properties[name]
+		if !ok {
+			continue
+		}
+		omitempty := ""
+		if !contains(name, component.Value.Required) {
+			omitempty = ",omitempty"
+		}
 
-						case "object":
-							t := objVal.Type
-							if objVal.Items != nil {
-								t = objVal.Items.Value.Type
-							}
-							typ, ok := typeConvMap[t]
-							if ok {
-								g.pp("	%s %s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
-								fieldTypes[field] = typ
-							}
-						default:
-							typ, ok := typeConvMap[objVal.Type]
-							if ok {
-								g.pp("	%s *%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
-								fieldTypes[field] = typ
-							}
-						}
-					} else {
-						typ, ok := typeConvMap[val.Type]
-						if ok {
-							g.pp("	%s %s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
-							fieldTypes[field] = typ
-						}
-					}
-				case "array":
-					if val.Items.Value != nil {
-						typ, ok := typeConvMap[val.Items.Value.Type]
-						if ok {
-							g.pp("	%s []%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
-							fieldTypes[field] = "[]" + typ
-						}
-					}
-
-				default:
-					typ, ok := typeConvMap[val.Type]
-					if ok {
-						g.pp("	%s *%s `json:\"%s,omitempty\"`", Depunct(field, true), typ, field)
-						fieldTypes[field] = typ
-					}
+		switch {
+		case property.Ref != "":
+			ref, ok := schemas[pathpkg.Base(property.Ref)]
+			if !ok {
+				fmt.Fprintf(os.Stderr, "property.Ref: %#v\n", property.Ref)
+				for name, schema := range schemas {
+					fmt.Fprintf(os.Stderr, "name: %s, schema: %#v\n", name, schema)
 				}
 			}
+			switch val := ref.Value; val.Type {
+			case "object":
+				if val.AdditionalProperties != nil && val.AdditionalProperties.Value != nil {
+					switch objVal := val.AdditionalProperties.Value; objVal.Type {
+					case "array":
+						if objVal.Items.Value != nil {
+							typ, ok := typeConvMap[objVal.Items.Value.Type]
+							if ok {
+								g.pp("	%s []%s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+								propertyTypes[name] = "[]" + typ
+							}
+						}
+
+					case "object":
+						t := objVal.Type
+						if objVal.Items != nil {
+							t = objVal.Items.Value.Type
+						}
+						typ, ok := typeConvMap[t]
+						if ok {
+							g.pp("	%s %s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+							propertyTypes[name] = typ
+						}
+
+					default:
+						typ, ok := typeConvMap[objVal.Type]
+						if ok {
+							g.pp("	%s %s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+							propertyTypes[name] = typ
+						}
+					}
+				} else {
+					typ, ok := typeConvMap[val.Type]
+					if ok {
+						g.pp("	%s %s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+						propertyTypes[name] = typ
+					}
+				}
+
+			case "array":
+				if val.Items.Value != nil {
+					typ, ok := typeConvMap[val.Items.Value.Type]
+					if ok {
+						g.pp("	%s []%s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+						propertyTypes[name] = "[]" + typ
+					}
+				}
+
+			default:
+				typ, ok := typeConvMap[val.Type]
+				if ok {
+					g.pp("	%s %s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+					propertyTypes[name] = typ
+				}
+			}
+
+		case property.Value != nil:
+			switch val := property.Value; val.Type {
+			case "object":
+				if val.AdditionalProperties != nil && val.AdditionalProperties.Value != nil {
+					switch objVal := val.AdditionalProperties.Value; objVal.Type {
+					case "array":
+						if objVal.Items.Value != nil {
+							typ, ok := typeConvMap[objVal.Items.Value.Type]
+							if ok {
+								g.pp("	%s []%s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+								propertyTypes[name] = "[]" + typ
+							}
+						}
+
+					case "object":
+						t := objVal.Type
+						if objVal.Items != nil {
+							t = objVal.Items.Value.Type
+						}
+						typ, ok := typeConvMap[t]
+						if ok {
+							g.pp("	%s %s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+							propertyTypes[name] = typ
+						}
+
+					default:
+						typ, ok := typeConvMap[objVal.Type]
+						if ok {
+							g.pp("	%s %s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+							propertyTypes[name] = typ
+						}
+					}
+				} else {
+					typ, ok := typeConvMap[val.Type]
+					if ok {
+						g.pp("	%s %s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+						propertyTypes[name] = typ
+					}
+				}
+
+			case "array":
+				if val.Items.Value != nil {
+					typ, ok := typeConvMap[val.Items.Value.Type]
+					if ok {
+						g.pp("	%s []%s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+						propertyTypes[name] = "[]" + typ
+					}
+				}
+
+			default:
+				typ, ok := typeConvMap[val.Type]
+				if ok {
+					g.pp("	%s %s `json:\"%s%s\"`", Depunct(name, true), typ, name, omitempty)
+					propertyTypes[name] = typ
+				}
+			}
+		}
+	}
+	g.pp("}")
+
+	for _, field := range propertyNames {
+		reciever := strings.ToLower(string(modelName[0]))
+		fieldType := propertyTypes[field]
+		if fieldType == "" {
+			continue
+		}
+		field := Depunct(field, true)
+
+		g.pp("// Get%[1]s returns the %[1]s field value if set, zero value otherwise.", field)
+		g.pp("func (%s *%s) Get%s() (ret %s) {", reciever, Depunct(modelName, true), field, fieldType)
+		g.pp(" 	if %[1]s == nil {", reciever)
+		g.pp(" 		return ret")
+		g.pp(" 	}")
+		// TODO(zchee): parse actual field type
+		switch fieldType {
+		case "map[string]interface{}", "interface{}":
+			g.pp(" 	return %s.%s", reciever, field)
+		default:
+			g.p(" 	return ")
+			g.pp("%s.%s", reciever, field)
 		}
 		g.pp("}")
 
-		for _, field := range fields {
-			reciever := strings.ToLower(string(name[0]))
-			fieldType := fieldTypes[field]
-			if fieldType == "" {
-				continue
-			}
-			field := Depunct(field, true)
+		// g.p("\n")
 
-			g.pp("// Get%[1]s returns the %[1]s field value if set, zero value otherwise.", field)
-			g.pp("func (%s *%s) Get%s() (ret %s) {", reciever, Depunct(name, true), field, fieldType)
-			g.pp(" 	if %[1]s == nil || %[1]s.%[2]s == nil {", reciever, field)
-			g.pp(" 		return ret")
-			g.pp(" 	}")
-			// TODO(zchee): parse actual field type
-			switch fieldType {
-			case "map[string]interface{}", "interface{}":
-				g.pp(" 	return %s.%s", reciever, field)
-			default:
-				g.p(" 	return ")
-				if !strings.HasPrefix(fieldType, "[]") {
-					g.p("*")
-				}
-				g.pp("%s.%s", reciever, field)
-			}
-			g.pp("}")
+		// g.pp("// Has%s reports whether the field has been set", field)
+		// g.pp("func (%s *%s) Has%s() bool {", reciever, Depunct(modelName, true), field)
+		// g.pp(" 	if %[1]s != nil && %[1]s.%[2]s != nil {", reciever, field)
+		// g.pp(" 		return true")
+		// g.pp(" 	}")
+		// g.pp(" 	return false")
+		// g.pp("}")
+		//
+		// g.p("\n")
 
-			g.p("\n")
-
-			g.pp("// Has%s reports whether the field has been set", field)
-			g.pp("func (%s *%s) Has%s() bool {", reciever, Depunct(name, true), field)
-			g.pp(" 	if %[1]s != nil && %[1]s.%[2]s != nil {", reciever, field)
-			g.pp(" 		return true")
-			g.pp(" 	}")
-			g.pp(" 	return false")
-			g.pp("}")
-
-			g.p("\n")
-
-			g.pp("// Set%[1]s gets a reference to the given string and assigns it to the %[1]s field.", field)
-
-			// TODO(zchee): parse actual field type
-			switch {
-			case fieldType == "map[string]interface{}", fieldType == "interface{}":
-				g.pp("func (%s *%s) Set%s(val %s) {", reciever, Depunct(name, true), field, fieldType)
-				g.pp("	%s.%s = val", reciever, field)
-
-			default:
-				if typ, ok := typeConvMap[fieldType]; ok {
-					var hasPtr bool
-					if !strings.HasPrefix(typ, "[]") {
-						hasPtr = true
-					}
-					g.p("func (%s ", reciever)
-					if hasPtr {
-						g.p("*")
-					}
-					g.pp("%s) Set%s(val %s) {", Depunct(name, true), field, typ)
-
-					g.p("	%s.%s = ", reciever, field)
-					if hasPtr {
-						g.p("&")
-					}
-					g.pp("val")
-				}
-			}
-			g.pp("}")
-		}
+		// g.pp("// Set%[1]s gets a reference to the given string and assigns it to the %[1]s field.", field)
+		//
+		// // TODO(zchee): parse actual field type
+		// switch {
+		// case fieldType == "map[string]interface{}", fieldType == "interface{}":
+		// 	g.pp("func (%s *%s) Set%s(val %s) {", reciever, Depunct(modelName, true), field, fieldType)
+		// 	g.pp("	%s.%s = val", reciever, field)
+		//
+		// default:
+		// 	if typ, ok := typeConvMap[fieldType]; ok {
+		// 		var hasPtr bool
+		// 		if !strings.HasPrefix(typ, "[]") {
+		// 			hasPtr = true
+		// 		}
+		// 		g.p("func (%s ", reciever)
+		// 		if hasPtr {
+		// 			g.p("*")
+		// 		}
+		// 		g.pp("%s) Set%s(val %s) {", Depunct(modelName, true), field, typ)
+		//
+		// 		g.p("	%s.%s = ", reciever, field)
+		// 		if hasPtr {
+		// 			g.p("&")
+		// 		}
+		// 		g.pp("val")
+		// 	}
+		// }
+		// g.pp("}")
 	}
 }
 
@@ -1083,4 +1208,14 @@ func (g *Generator) WriteSchemaDescriptor() {
 		b = b[n:]
 	}
 	g.pp("}")
+}
+
+func contains(s string, ss []string) bool {
+	for _, str := range ss {
+		if str == s {
+			return true
+		}
+	}
+
+	return false
 }
