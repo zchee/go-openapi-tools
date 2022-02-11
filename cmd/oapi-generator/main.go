@@ -10,7 +10,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/zchee/go-openapi-tools/pkg/compiler"
+	"github.com/zchee/go-openapi-tools/compiler"
 )
 
 const (
