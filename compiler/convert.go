@@ -33,6 +33,11 @@ func IsVowel(r rune) bool {
 	}
 }
 
+// IsDigit returns whether the r is digit.
+func IsDigit(c byte) bool {
+	return '0' <= c && c <= '9'
+}
+
 // SortedMapKeys returns the keys of m, which must be a map[string]T, in sorted order.
 func SortedMapKeys(v interface{}) []string {
 	m, ok := v.(map[string]interface{})
@@ -83,5 +88,10 @@ func Depunct(ident string, needCap bool) string {
 	if s == "Typ" {
 		return "Type" // special case
 	}
+
+	if IsDigit(s[0]) {
+		s = "X_" + s
+	}
+
 	return s
 }

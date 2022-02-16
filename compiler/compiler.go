@@ -128,7 +128,6 @@ type Generator struct {
 	schemaType schemaType
 	pkgName    string
 
-	f     *os.File
 	buf   *bytes.Buffer
 	files map[string][]byte
 
@@ -175,13 +174,12 @@ func New(schemaType, pkgName, filename string) (*Generator, error) {
 		return nil, err
 	}
 
-	f, err := os.Open(filename)
+	buf, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
-	g.f = f
 
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(bytes.NewReader(buf))
 
 	switch g.schemaType {
 	case openAPISchema:
@@ -240,43 +238,34 @@ func (g *Generator) Generate(dst string) (err error) {
 		}
 	}
 
-	return g.f.Close()
+	return nil
 }
 
-func apiFileName(name string) string {
-	filename := "api_" + strcase.ToSnake(name)
-	if strings.HasSuffix(filename, "_test") {
-		filename += "_gen"
+func fileName(prefix, name string) string {
+	fname := prefix + "_" + strcase.ToSnake(name)
+	if strings.HasSuffix(fname, "_test") {
+		fname += "_gen"
 	}
 
-	return filename + ".go"
-}
-
-func modelFileName(name string) string {
-	filename := "model_" + strcase.ToSnake(name)
-	if strings.HasSuffix(filename, "_test") {
-		filename += "_gen"
-	}
-
-	return filename + ".go"
+	return fname + ".go"
 }
 
 // generate generates Go source code from OpenAPI spec.
 //
 // It works sequential, does not needs mutex lock.
 func (g *Generator) generate() error {
-	// write doc.go
+	// writes doc.go
 	g.WriteHeader()
 	g.p("\n")
 	g.WriteDoc()
 	bufDoc := g.buf.Bytes()
 	doc, err := goformat.Source(bufDoc)
 	if err != nil {
-		return fmt.Errorf("could not format doc.go: %w", err)
+		return fmt.Errorf("could not format doc.go: %w\n%s", err, string(bufDoc))
 	}
 	g.files[docFileName] = doc
 
-	// write client.go
+	// writes client.go
 	g.buf.Reset()
 	g.WriteHeader()
 	g.p("\n")
@@ -290,16 +279,16 @@ func (g *Generator) generate() error {
 	g.WriteSchemaDescriptor()
 
 	b := g.buf.Bytes()
-	out, err := goformat.Source(b)
+	client, err := goformat.Source(b)
 	if err != nil {
-		return fmt.Errorf("could not format client.go: %w", err)
+		return fmt.Errorf("could not format client.go: %w\n%s", err, string(b))
 	}
-	g.files[clientFileName] = out
+	g.files[clientFileName] = client
 
-	// write api_xxx.go
-	for _, tag := range g.GetService() { // []*openapi3.Tag
-		fmt.Printf("tag: %#v\n", tag)
+	// writes api_xxx.go
+	for _, tag := range g.GetService() {
 		g.buf.Reset()
+		fmt.Printf("tag: %#v\n", tag)
 		g.WriteHeader()
 		g.p("\n")
 		g.WritePackage()
@@ -311,11 +300,12 @@ func (g *Generator) generate() error {
 		bufAPI := g.buf.Bytes()
 		api, err := goformat.Source(bufAPI)
 		if err != nil {
-			return fmt.Errorf("could not format %s api: %w", tag.Name, err)
+			return fmt.Errorf("could not format %s api: %w\n%s", tag.Name, err, string(bufAPI))
 		}
-		g.files[apiFileName(tag.Name)] = api
+		g.files[fileName("api", tag.Name)] = api
 	}
 
+	// sorts schemas alphabetically by those names
 	schemas := make([]string, len(g.openAPI.Components.Schemas))
 	i := 0
 	for name := range g.openAPI.Components.Schemas {
@@ -324,16 +314,10 @@ func (g *Generator) generate() error {
 	}
 	sort.Strings(schemas)
 
-	// write models
+	// writes models sorted by names
 	for _, name := range schemas {
-		ref := g.openAPI.Components.Schemas[name]
-		if name == "objs_bot_profile" {
-			fmt.Fprintf(os.Stderr, "name: %s, ref: %#v\n", name, ref.Value)
-		}
-	}
-	for _, name := range schemas {
-		ref := g.openAPI.Components.Schemas[name]
 		g.buf.Reset()
+		ref := g.openAPI.Components.Schemas[name]
 		g.WriteHeader()
 		g.p("\n")
 		g.WritePackage()
@@ -343,12 +327,12 @@ func (g *Generator) generate() error {
 		bufModel := g.buf.Bytes()
 		model, err := goformat.Source(bufModel)
 		if err != nil {
-			return fmt.Errorf("could not format %s model: %w", name, err)
+			return fmt.Errorf("could not format %s model: %w\n%s", name, err, string(bufModel))
 		}
-		g.files[modelFileName(name)] = model
+		g.files[fileName("model", name)] = model
 	}
 
-	// write utils.go
+	// writes utils.go
 	g.buf.Reset()
 	g.WriteHeader()
 	g.p("\n")
@@ -360,9 +344,7 @@ func (g *Generator) generate() error {
 	bufUtils := g.buf.Bytes()
 	utils, err := goformat.Source(bufUtils)
 	if err != nil {
-		return fmt.Errorf("could not format utils.go: %w", err)
-		// log.Printf("utils: %#v\n", err)
-		// utils = bufUtils
+		return fmt.Errorf("could not format utils.go: %w\n%s", err, string(bufUtils))
 	}
 	g.files[utilsFileName] = utils
 
@@ -394,14 +376,37 @@ func (g *Generator) GetMethods() map[*Service]PathItemsMap {
 	g.methodsOnce.Do(func() {
 		g.methods = make(map[*Service]PathItemsMap)
 
-		// fmt.Printf("a.openAPI.Tags: %#v\n", a.openAPI.Tags)
 		switch len(g.openAPI.Tags) {
 		case 0:
 			g.methods[defaultService] = make(map[string][]*openapi3.PathItem)
 
 		default:
-			// initialize a.methods map keys to *openapi3.Tag
+			// serviceMap := make(map[string]*Service)
+			//
+			// // initialize a.methods map keys to *openapi3.Tag
+			// for _, tag := range g.openAPI.Tags {
+			// 	if idx := strings.Index(tag.Name, "."); idx > -1 {
+			// 		tag.Name = tag.Name[:idx]
+			// 	}
+			//
+			// 	if svc, ok := serviceMap[tag.Name]; ok {
+			// 		svc.tags = append(svc.tags, tag)
+			// 		serviceMap[tag.Name] = svc
+			// 		continue
+			// 	}
+			//
+			// 	serviceMap[tag.Name] = &Service{
+			// 		Name: tag.Name,
+			// 		tags: openapi3.Tags{tag},
+			// 	}
+			// }
+			//
+			// for _, svc := range serviceMap {
+			// 	g.methods[svc] = make(map[string][]*openapi3.PathItem)
+			// }
+
 			for _, tag := range g.openAPI.Tags {
+				tag.Name = strings.Trim(strings.ReplaceAll(tag.Name, " ", ""), " (apps)")
 				s := &Service{
 					Name: tag.Name,
 					tags: openapi3.Tags{tag},
@@ -413,7 +418,6 @@ func (g *Generator) GetMethods() map[*Service]PathItemsMap {
 		// makes a.methods
 		for path, item := range g.openAPI.Paths {
 			for _, op := range item.Operations() {
-				// fmt.Printf("op.Tags: %T = %#v\n", op.Tags, op.Tags)
 				switch len(op.Tags) {
 				case 0:
 					fmt.Fprintf(os.Stderr, "path: %T = %#v, item: %T = %#v\n", path, path, item, item)
@@ -446,7 +450,7 @@ func (g *Generator) WriteHeader() {
 // WriteDoc writes package top level synopsis.
 func (g *Generator) WriteDoc() {
 	g.pp("// Package %s provides access to the %s REST API.", g.pkgName, Depunct(g.pkgName, true))
-	g.pp("package %s", g.pkgName)
+	g.WritePackage()
 }
 
 // WritePackage writes package statement.
@@ -654,24 +658,27 @@ const (
 
 // WriteMethods writes child Service methods.
 func (g *Generator) WriteMethods(svcName string, service *Service) {
-	operations := make(map[string]map[string]*openapi3.Operation) // map[path]map[method]*openapi3.Operation
+	operations := make(map[string]map[string]*openapi3.Operation)
 	paths := make([]string, 0, len(g.methods[service]))
-	methods := make([]string, 0, 7)
+	// http.MethodConnect | http.MethodDelete | http.MethodGet | http.MethodHead | http.MethodOptions | http.MethodPatch | http.MethodPost | http.MethodPut | http.MethodTrace
+	methods := make([]string, 0, 9)
 
-	for path, pathItems := range g.methods[service] { // map[path][]*openapi3.PathItem
+	for path, pathItems := range g.methods[service] {
 		paths = append(paths, path)
-		for _, item := range pathItems { // []*openapi3.PathItem
-			for method, o := range item.Operations() { // map[method]*openapi3.Operation
+		for _, item := range pathItems {
+			for method, op := range item.Operations() {
 				methods = append(methods, method)
-				o.OperationID = Depunct(o.OperationID, true)
+				op.OperationID = Depunct(op.OperationID, true)
+
 				// Go idiom
-				if o.OperationID != "Get" {
-					o.OperationID = strings.ReplaceAll(o.OperationID, "Get", "")
+				if op.OperationID != "Get" {
+					op.OperationID = strings.ReplaceAll(op.OperationID, "Get", "")
 				}
+
 				if operations[path] == nil {
 					operations[path] = make(map[string]*openapi3.Operation)
 				}
-				operations[path][method] = o
+				operations[path][method] = op
 			}
 		}
 	}
@@ -679,9 +686,9 @@ func (g *Generator) WriteMethods(svcName string, service *Service) {
 	sort.Strings(methods)
 
 	seen := make(map[string]bool)
-	for _, path := range paths { // []string{paths}
-		for _, method := range methods { // []string{paths}
-			op, ok := operations[path][method] // map[method]*openapi3.Operation
+	for _, path := range paths {
+		for _, method := range methods {
+			op, ok := operations[path][method]
 			if ok {
 				methType := fmt.Sprintf("%s%sCall", svcName, op.OperationID)
 				if seen[methType] {
@@ -744,7 +751,7 @@ func (g *Generator) WriteMethods(svcName string, service *Service) {
 				// write path fields
 				if len(pathParam) > 0 {
 					g.pp("	// path fields")
-					for _, param := range pathParam { // []*openapi3.ParameterRef
+					for _, param := range pathParam {
 						paramName := NormalizeParam(Depunct(param.Value.Name, false))
 						paramType, ok := typeConvMap[param.Value.Schema.Value.Type]
 						if !ok {
@@ -757,7 +764,7 @@ func (g *Generator) WriteMethods(svcName string, service *Service) {
 				// write query fields
 				if len(pm[openapi3.ParameterInQuery]) > 0 {
 					g.pp("	// query fields")
-					for _, param := range pm[openapi3.ParameterInQuery] { // []*openapi3.ParameterInQuery
+					for _, param := range pm[openapi3.ParameterInQuery] {
 						paramName := NormalizeParam(Depunct(param.Value.Name, false))
 						if param.Value.Schema == nil {
 							continue
@@ -775,30 +782,40 @@ func (g *Generator) WriteMethods(svcName string, service *Service) {
 
 				g.p("\n")
 
-
-				g.pp("type %sResponse struct {", methType)
 				pathItem := g.openAPI.Paths[path]
 				resp := pathItem.GetOperation(method).Responses["200"]
-				for _, content := range resp.Value.Content {
-					for _, prop := range content.Schema.Value.Properties {
-						omitempty := ""
-						if prop.Ref == "" || prop.Value == nil {
-							continue
-						}
-						if !contains(prop.Ref, prop.Value.Required) {
-							omitempty = ",omitempty"
-						}
-						paramName := NormalizeParam(Depunct(prop.Ref, false))
-						paramType, ok := typeConvMap[prop.Value.Type]
-						if !ok {
-							continue
-						}
+				// fmt.Fprintf(os.Stderr, "resp.Value.Content: %#v\n", resp.Value.Content.Get("application/json").Schema.Value)
+				first := false
+				if resp != nil && resp.Value != nil && resp.Value.Content != nil {
+					g.p("type %sResponse struct {", methType)
+					for media := range resp.Value.Content {
+						content := resp.Value.Content.Get(media)
+						if content.Schema != nil && content.Schema.Value != nil && content.Schema.Value.Properties != nil {
+							for propName, prop := range resp.Value.Content.Get(media).Schema.Value.Properties {
+								if prop.Value == nil {
+									continue
+								}
+								omitempty := ""
+								if !contains(propName, resp.Value.Content.Get("application/json").Schema.Value.Required) {
+									omitempty = ",omitempty"
+								}
+								paramName := strcase.ToCamel(Depunct(propName, true))
+								paramType, ok := typeConvMap[prop.Value.Type]
+								if !ok {
+									continue
+								}
 
-						g.pp("	%s %s `json:\"%s%s\"`", paramName, paramType, prop.Ref, omitempty)
+								if !first {
+									g.p("\n")
+								}
+								first = true
+								g.pp("	%s %s `json:\"%s%s\"`", paramName, paramType, propName, omitempty)
+							}
+						}
 					}
+					g.pp("}")
+					g.p("\n")
 				}
-				g.pp("}")
-				g.p("\n")
 
 				// writes operation summary, if any
 				if summary := strings.ToLower(op.Summary); summary != "" {
@@ -814,7 +831,7 @@ func (g *Generator) WriteMethods(svcName string, service *Service) {
 				g.p("func (r *%s) %s(", svcName, op.OperationID)
 				if len(pathParam) > 0 {
 					for i, param := range pathParam {
-						g.p("%s %s", Depunct(param.Value.Name, false), param.Value.Schema.Value.Type)
+						g.p("%s %s", Depunct(param.Value.Name, false), typeConvMap[param.Value.Schema.Value.Type])
 						if i < len(pathParam)-1 {
 							g.p(", ")
 						}
@@ -837,7 +854,7 @@ func (g *Generator) WriteMethods(svcName string, service *Service) {
 				g.p("\n")
 
 				// write query method chains
-				for _, param := range pm[openapi3.ParameterInQuery] { // []*openapi3.Parameter
+				for _, param := range pm[openapi3.ParameterInQuery] {
 					paramName := NormalizeParam(Depunct(param.Value.Name, false))
 					argName := Depunct(paramName, true)
 					typeName := paramName
@@ -845,7 +862,7 @@ func (g *Generator) WriteMethods(svcName string, service *Service) {
 						continue
 					}
 					g.pp("func (c *%[1]s) %[2]s(%[3]s %[4]s) *%[1]s {", methType, argName, typeName, typeConvMap[param.Value.Schema.Value.Type])
-					g.pp("	c.params.Set(%[1]q, fmt.Sprintf(\"%%v\", %[1]s))", typeName)
+					g.pp("	c.params.Set(%[1]q, fmt.Sprintf(\"%%s\", %[1]s))", typeName)
 					g.pp("	return c")
 					g.pp("}")
 					g.p("\n")
@@ -862,7 +879,7 @@ func (g *Generator) WriteMethods(svcName string, service *Service) {
 						}
 						endIdx := strings.Index(path[idx+1:], "}")
 
-						path = path[:idx] + `" + ` + "fmt.Sprintf(\"%v\", c." + Depunct(param.Value.Name, false) + ")" + ` + "` + path[idx+1+endIdx+1:]
+						path = path[:idx] + `" + ` + "fmt.Sprintf(\"%s\", c." + Depunct(param.Value.Name, false) + ")" + ` + "` + path[idx+1+endIdx+1:]
 					}
 				}
 				methodType := "http.Method" + strcase.ToCamel(strings.ToLower(method))
@@ -938,7 +955,7 @@ func (g *Generator) WriteModel(modelName string, component *openapi3.SchemaRef, 
 		if IsVowel(rune(description[0])) {
 			desc += "n"
 		}
-		desc += " " + description
+		desc += " " + strings.ReplaceAll(description, "\n", "\n// ")
 	}
 	g.pp(desc)
 
@@ -1077,7 +1094,7 @@ func (g *Generator) WriteModel(modelName string, component *openapi3.SchemaRef, 
 			}
 		}
 	}
-	g.pp("}")
+	g.pp("}\n")
 
 	for _, field := range propertyNames {
 		reciever := strings.ToLower(string(modelName[0]))
@@ -1092,15 +1109,16 @@ func (g *Generator) WriteModel(modelName string, component *openapi3.SchemaRef, 
 		g.pp(" 	if %[1]s == nil {", reciever)
 		g.pp(" 		return ret")
 		g.pp(" 	}")
-		// TODO(zchee): parse actual field type
+
 		switch fieldType {
 		case "map[string]interface{}", "interface{}":
 			g.pp(" 	return %s.%s", reciever, field)
+
 		default:
 			g.p(" 	return ")
 			g.pp("%s.%s", reciever, field)
 		}
-		g.pp("}")
+		g.pp("}\n")
 
 		// g.p("\n")
 
@@ -1208,14 +1226,4 @@ func (g *Generator) WriteSchemaDescriptor() {
 		b = b[n:]
 	}
 	g.pp("}")
-}
-
-func contains(s string, ss []string) bool {
-	for _, str := range ss {
-		if str == s {
-			return true
-		}
-	}
-
-	return false
 }
