@@ -1,12 +1,12 @@
 module github.com/zchee/go-openapi-tools
 
-go 1.17
+go 1.24
 
 require (
 	github.com/getkin/kin-openapi v0.89.0
 	github.com/goccy/go-json v0.9.4
 	github.com/iancoleman/strcase v0.2.0
-	github.com/klauspost/compress v1.14.2
+	github.com/klauspost/compress v1.18.7
 )
 
 require (
